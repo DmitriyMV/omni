@@ -22,12 +22,12 @@ func TestReconciler(t *testing.T) {
 
 	err := reconciler.Reconcile("cluster1", map[string][]string{
 		"alias1": {
-			"upstream1",
-			"upstream2",
+			"upstream1:8080",
+			"upstream2:8080",
 		},
 		"alias2": {
-			"upstream3",
-			"upstream4",
+			"upstream1:8080",
+			"upstream2:8080",
 		},
 	})
 	require.NoError(t, err)
@@ -58,4 +58,26 @@ func TestReconciler(t *testing.T) {
 
 	require.Nil(t, proxy)
 	require.Zero(t, id)
+
+	err = reconciler.Reconcile("cluster2", map[string][]string{
+		"alias3": {
+			"upstream3:8080",
+			"upstream4:8080",
+		},
+		"alias4": {
+			"upstream3:8080",
+			"upstream4:8080",
+		},
+	})
+	require.NoError(t, err)
+
+	err = reconciler.Reconcile("cluster2", map[string][]string{
+		"alias3": {
+			"upstream3:8080",
+		},
+		"alias5": {
+			"upstream3:8080",
+		},
+	})
+	require.NoError(t, err)
 }

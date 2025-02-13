@@ -67,7 +67,7 @@ require (
 	github.com/siderolabs/go-circular v0.2.2
 	github.com/siderolabs/go-debug v0.5.0
 	github.com/siderolabs/go-kubernetes v0.2.17
-	github.com/siderolabs/go-loadbalancer v0.3.4
+	github.com/siderolabs/go-loadbalancer v0.4.0
 	github.com/siderolabs/go-pointer v1.0.0
 	github.com/siderolabs/go-procfs v0.1.2
 	github.com/siderolabs/go-retry v0.3.3
@@ -80,7 +80,6 @@ require (
 	github.com/siderolabs/proto-codec v0.1.2
 	github.com/siderolabs/siderolink v0.3.12
 	github.com/siderolabs/talos/pkg/machinery v1.10.0-alpha.0
-	github.com/siderolabs/tcpproxy v0.1.0
 	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/cobra v1.8.1
 	github.com/stretchr/testify v1.10.0
@@ -218,6 +217,7 @@ require (
 	github.com/siderolabs/go-kubeconfig v0.1.0 // indirect
 	github.com/siderolabs/net v0.4.0 // indirect
 	github.com/siderolabs/protoenc v0.2.2 // indirect
+	github.com/siderolabs/tcpproxy v0.1.0 // indirect
 	github.com/soheilhy/cmux v0.1.5 // indirect
 	github.com/spf13/pflag v1.0.6 // indirect
 	github.com/stoewer/go-strcase v1.3.0 // indirect

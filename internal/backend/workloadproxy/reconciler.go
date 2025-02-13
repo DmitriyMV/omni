@@ -6,82 +6,76 @@
 package workloadproxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"reflect"
+	"slices"
 	"sync"
 	"time"
 
-	"github.com/akutz/memconn"
 	"github.com/cosi-project/runtime/pkg/resource"
-	"github.com/hashicorp/go-multierror"
-	"github.com/siderolabs/go-loadbalancer/loadbalancer"
+	"github.com/hashicorp/go-cleanhttp"
+	"github.com/siderolabs/gen/xiter"
 	"github.com/siderolabs/go-loadbalancer/upstream"
-	"github.com/siderolabs/tcpproxy"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
-type lbStatus struct {
-	lb *loadbalancer.TCP
-}
-
-// Close closes the load balancer and waits for it to terminate.
-//
-// It should be called only if it was successfully started, otherwise it blocks indefinitely on the Wait call.
-func (lbSts *lbStatus) Close() error {
-	var lb *loadbalancer.TCP
-
-	lb, lbSts.lb = lbSts.lb, nil
-
-	if lb == nil {
-		return nil
-	}
-
-	if err := lb.Close(); err != nil {
-		return fmt.Errorf("failed to close LB: %w", err)
-	}
-
-	if err := lb.Wait(); err != nil && !errors.Is(err, net.ErrClosed) {
-		return fmt.Errorf("failed to wait for load balancer: %w", err)
-	}
-
-	return nil
-}
-
 // Reconciler reconciles the load balancers for a cluster.
+//
+//nolint:govet
 type Reconciler struct {
-	clusterToAliasToLBStatus map[resource.ID]map[string]*lbStatus
-	aliasToCluster           map[string]resource.ID
+	logger    *zap.Logger
+	logLevel  zapcore.Level
+	transport *http.Transport
 
-	connProvider *memconn.Provider
-	logger       *zap.Logger
-	lbLogger     *zap.Logger
-	logLevel     zapcore.Level
-	mu           sync.Mutex
+	mu               sync.Mutex
+	clusterUpstreams map[resource.ID]*lazyUpstreams
+	aliasToCluster   map[string]resource.ID
 }
 
 // NewReconciler creates a new Reconciler.
 func NewReconciler(logger *zap.Logger, logLevel zapcore.Level) *Reconciler {
-	// use an in-memory transport for the connections to the load balancer
-	provider := &memconn.Provider{}
-
-	provider.MapNetwork("tcp", "memu")
-
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 
-	return &Reconciler{
-		clusterToAliasToLBStatus: map[resource.ID]map[string]*lbStatus{},
-		aliasToCluster:           map[string]resource.ID{},
-		connProvider:             provider,
-		logger:                   logger,
-		lbLogger:                 logger.WithOptions(zap.IncreaseLevel(zapcore.ErrorLevel)),
-		logLevel:                 logLevel,
+	trans := cleanhttp.DefaultPooledTransport()
+
+	rec := &Reconciler{
+		logger:         logger,
+		logLevel:       logLevel,
+		transport:      trans,
+		aliasToCluster: map[string]resource.ID{},
+	}
+
+	rec.setTransportDialer(trans)
+
+	return rec
+}
+
+func (registry *Reconciler) init(cluster resource.ID) {
+	if registry.clusterUpstreams == nil {
+		registry.clusterUpstreams = map[resource.ID]*lazyUpstreams{}
+	}
+
+	if registry.aliasToCluster == nil {
+		registry.aliasToCluster = map[string]resource.ID{}
+	}
+
+	if _, ok := registry.clusterUpstreams[cluster]; !ok {
+		registry.clusterUpstreams[cluster] = &lazyUpstreams{
+			clusterID: cluster,
+			logger: func(msg string, fields ...zap.Field) {
+				registry.logger.Log(registry.logLevel, msg, fields...)
+			},
+		}
 	}
 }
 
@@ -92,139 +86,292 @@ func (registry *Reconciler) Reconcile(cluster resource.ID, aliasToUpstreamAddres
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 
-	var errs error
+	reflect.New(reflect.TypeOf(cluster).Elem()).IsZero()
 
-	// drop removed LBs
-	for alias := range registry.clusterToAliasToLBStatus[cluster] {
-		if _, ok := aliasToUpstreamAddresses[alias]; ok { // still present
+	registry.init(cluster)
+
+	for als, cl := range registry.aliasToCluster {
+		if cluster != cl {
 			continue
 		}
 
-		// not present anymore, remove
-		registry.removeLB(cluster, alias)
-	}
+		if _, ok := aliasToUpstreamAddresses[als]; ok {
+			registry.aliasToCluster[als] = cluster
 
-	// ensure new LBs
-	for alias, upstreamAddresses := range aliasToUpstreamAddresses {
-		if err := registry.ensureLB(cluster, alias, upstreamAddresses); err != nil {
-			errs = multierror.Append(errs, fmt.Errorf("failed to register LB: %w", err))
-		}
-	}
-
-	return errs
-}
-
-// ensureLB ensures that a load balancer exists and started for the given cluster and alias, targeting the given upstream addresses.
-func (registry *Reconciler) ensureLB(cluster resource.ID, alias string, upstreamAddresses []string) error {
-	registry.logger.Log(registry.logLevel, "ensure LB", zap.String("cluster", cluster), zap.String("alias", alias), zap.Strings("upstream_addresses", upstreamAddresses))
-
-	hostPort := registry.hostPortForAlias(cluster, alias)
-	lbSts := registry.clusterToAliasToLBStatus[cluster][alias]
-
-	if lbSts == nil { // no LB yet, create and start it
-		tcpLB := &loadbalancer.TCP{
-			Logger: registry.lbLogger,
-			Proxy: tcpproxy.Proxy{
-				ListenFunc: registry.connProvider.Listen,
-			},
-			DialTimeout:    1 * time.Second,
-			TCPUserTimeout: 5 * time.Second,
+			continue
 		}
 
-		if err := tcpLB.AddRoute(
-			hostPort, upstreamAddresses,
-			upstream.WithHealthcheckTimeout(time.Second),
-			upstream.WithHealthcheckInterval(time.Minute),
-		); err != nil {
-			return fmt.Errorf("failed to add route for %q/%q: %w", cluster, alias, err)
-		}
-
-		if err := tcpLB.Start(); err != nil {
-			registry.logger.Log(registry.logLevel, "failed to start LB, attempt to stop it")
-
-			startErr := fmt.Errorf("failed to start LB for %q/%q: %w", cluster, alias, err)
-
-			// we still need to close the loadbalancer, so that the health checks goroutines get terminated
-			if closeErr := tcpLB.Close(); closeErr != nil {
-				return errors.Join(startErr, fmt.Errorf("failed to close LB: %w", closeErr))
-			}
-
-			return startErr
-		}
-
-		lbSts = &lbStatus{
-			lb: tcpLB,
-		}
+		delete(registry.aliasToCluster, als)
 	}
 
-	if err := lbSts.lb.ReconcileRoute(hostPort, upstreamAddresses); err != nil {
-		return fmt.Errorf("failed to reconcile route for %q/%q: %w", cluster, alias, err)
+	for als := range aliasToUpstreamAddresses {
+		registry.aliasToCluster[als] = cluster
 	}
 
-	registry.aliasToCluster[alias] = cluster
-
-	if aliasToLB := registry.clusterToAliasToLBStatus[cluster]; aliasToLB == nil {
-		registry.clusterToAliasToLBStatus[cluster] = map[string]*lbStatus{}
+	// drop removed LBs
+	err := registry.clusterUpstreams[cluster].MergeState(aliasToUpstreamAddresses)
+	if err != nil {
+		return fmt.Errorf("failed to merge state: %w", err)
 	}
-
-	registry.clusterToAliasToLBStatus[cluster][alias] = lbSts
 
 	return nil
 }
 
 // GetProxy returns a proxy for the exposed service, targeting the load balancer for the given alias.
-func (registry *Reconciler) GetProxy(alias string) (http.Handler, resource.ID, error) {
+func (registry *Reconciler) GetProxy(als string) (http.Handler, resource.ID, error) {
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 
-	clusterID, ok := registry.aliasToCluster[alias]
+	clusterID, ok := registry.aliasToCluster[als]
 	if !ok {
 		return nil, "", nil
 	}
 
-	lbSts := registry.clusterToAliasToLBStatus[clusterID][alias]
-	if lbSts == nil || lbSts.lb == nil {
+	p := registry.clusterUpstreams[clusterID].PortForAlias(als)
+	if p == "" {
 		return nil, "", nil
 	}
 
-	hostPort := registry.hostPortForAlias(clusterID, alias)
+	proxy := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: net.JoinHostPort(clusterID, p)})
+	proxy.Transport = registry.transport
+	proxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
+		registry.logger.Error(
+			"proxy error",
+			zap.Error(err),
+			zap.String("cluster", clusterID),
+			zap.String("alias", als),
+			zap.String("alias_host", req.Host),
+		)
 
-	targetURL := &url.URL{
-		Scheme: "http",
-		Host:   hostPort,
-	}
-
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	proxy.Transport = &http.Transport{
-		DialContext: registry.connProvider.DialContext,
+		http.Error(w, "workload proxy error", http.StatusBadGateway)
 	}
 
 	return proxy, clusterID, nil
 }
 
-func (registry *Reconciler) removeLB(cluster resource.ID, alias string) {
-	registry.logger.Log(registry.logLevel, "remove LB", zap.String("cluster", cluster), zap.String("alias", alias))
-
-	aliasToLB := registry.clusterToAliasToLBStatus[cluster]
-	lbSts := aliasToLB[alias]
-
-	if lbSts != nil {
-		if err := lbSts.Close(); err != nil {
-			registry.logger.Error("failed to close LB", zap.String("cluster", cluster), zap.String("alias", alias), zap.Error(err))
-		}
+func (registry *Reconciler) setTransportDialer(trans *http.Transport) {
+	d := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
 	}
 
-	delete(aliasToLB, alias)
-	delete(registry.aliasToCluster, alias)
+	trans.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		clusterID, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid proxy dst address: %w", err)
+		}
 
-	if len(aliasToLB) == 0 {
-		delete(registry.clusterToAliasToLBStatus, cluster)
+		rem, err := registry.clusterUpstreams[clusterID].PickUpstream(port)
+
+		switch {
+		case err != nil:
+			return nil, fmt.Errorf("failed to pick upstream for cluster %q: %w", clusterID, err)
+		case rem == nil:
+			return nil, fmt.Errorf("failed to pick upstream for cluster %q", clusterID)
+		default:
+			return d.DialContext(ctx, network, rem.Addr)
+		}
 	}
 }
 
-// hostPortForAlias returns a unique IP:port for the given cluster and alias.
-//
-// The value is arbitrary, as it uses in-memory transport, never reached via the network.
-func (registry *Reconciler) hostPortForAlias(clusterID resource.ID, alias string) string {
-	return fmt.Sprintf("%s_%s:4242", clusterID, alias)
+type lazyUpstreams struct { //nolint:govet
+	clusterID string
+	logger    func(string, ...zap.Field)
+
+	mx            sync.Mutex
+	upstreamAddrs []string          // addresses of the upstreams without port
+	aliasToPorts  map[string]string // alias to port mapping
+	l             *upstream.List[*remote]
+	inUsePort     string
+	t             *time.Timer
+}
+
+func (lu *lazyUpstreams) PortForAlias(alias string) string {
+	if lu == nil {
+		return ""
+	}
+
+	lu.mx.Lock()
+	defer lu.mx.Unlock()
+
+	return lu.aliasToPorts[alias]
+}
+
+func (lu *lazyUpstreams) PickUpstream(port string) (*remote, error) {
+	if lu == nil {
+		return nil, errors.New("remote doesnt exist")
+	}
+
+	lu.mx.Lock()
+	defer lu.mx.Unlock()
+
+	if _, ok := xiter.Find(func(v string) bool { return port == v }, maps.Values(lu.aliasToPorts)); !ok {
+		return nil, fmt.Errorf("port %q is not in the list of ports", port)
+	}
+
+	if lu.t != nil {
+		lu.t.Stop()
+	}
+
+	if lu.l == nil {
+		it := xiter.Map(
+			func(addr string) *remote { return &remote{Addr: net.JoinHostPort(addr, port)} },
+			slices.Values(lu.upstreamAddrs),
+		)
+
+		l, err := upstream.NewListWithCmp(it, func(a, b *remote) bool { return a.Addr == b.Addr })
+		if err != nil {
+			return nil, err
+		}
+
+		lu.l = l
+		lu.inUsePort = port
+	}
+
+	if lu.t == nil {
+		lu.t = time.AfterFunc(5*time.Minute, lu.shutdown)
+	} else {
+		lu.t.Reset(5 * time.Minute)
+	}
+
+	return lu.l.Pick()
+}
+
+func (lu *lazyUpstreams) shutdown() {
+	lu.mx.Lock()
+	defer lu.mx.Unlock()
+
+	if lu.l == nil {
+		return
+	}
+
+	lu.l.Shutdown()
+
+	lu.l = nil
+}
+
+func (lu *lazyUpstreams) MergeState(m map[string][]string) error {
+	if lu == nil {
+		return nil
+	}
+
+	lu.mx.Lock()
+	defer lu.mx.Unlock()
+
+	upstreamAddrs := takeRandom(m)
+
+	// Delete the upstreams that are not in the new state
+	lu.upstreamAddrs = slices.DeleteFunc(lu.upstreamAddrs, func(addr string) bool {
+		if slices.Contains(upstreamAddrs, addr) {
+			return false
+		}
+
+		lu.logger("remove LB", zap.String("cluster", lu.clusterID), zap.String("upstream", addr))
+
+		return true
+	})
+
+	currentPort := lu.inUsePort
+
+	// Delete the aliases that are not in the new state
+	maps.DeleteFunc(lu.aliasToPorts, func(alias, port string) bool {
+		if _, ok := m[alias]; ok {
+			return false
+		}
+
+		if port == currentPort {
+			currentPort = ""
+		}
+
+		lu.logger("remove LB", zap.String("cluster", lu.clusterID), zap.String("alias", alias))
+
+		return true
+	})
+
+	// Add new upstreams
+	for _, addr := range upstreamAddrs {
+		if slices.Contains(lu.upstreamAddrs, addr) {
+			continue
+		}
+
+		lu.logger("add LB", zap.String("cluster", lu.clusterID), zap.String("upstream", addr))
+
+		lu.upstreamAddrs = append(lu.upstreamAddrs, addr)
+	}
+
+	// Add new aliases
+	if lu.aliasToPorts == nil {
+		lu.aliasToPorts = map[string]string{}
+	}
+
+	for als, upstreams := range m {
+		if _, ok := lu.aliasToPorts[als]; ok || len(upstreams) == 0 {
+			continue
+		}
+
+		ups := upstreams[0]
+
+		_, p, err := net.SplitHostPort(ups)
+		if err != nil {
+			return fmt.Errorf("failed to split host and port '%q' for alus '%q': %w", ups, als, err)
+		}
+
+		lu.logger("add LB", zap.String("cluster", lu.clusterID), zap.String("upstream", ups))
+
+		lu.aliasToPorts[als] = p
+	}
+
+	if lu.l == nil {
+		return nil // no load balancer running, no need to update the upstreams in it
+	}
+
+	if len(lu.upstreamAddrs) == 0 || len(lu.aliasToPorts) == 0 {
+		lu.logger("no upstreams or ports, shutting down LB", zap.String("cluster", lu.clusterID))
+
+		lu.t.Stop()
+		lu.l.Shutdown() // no upstreams or ports, no need to keep the load balancer running
+
+		lu.l = nil
+		lu.upstreamAddrs = nil
+		lu.aliasToPorts = nil
+
+		return nil
+	}
+
+	if currentPort == "" {
+		// old port no longer valid, need to select a new one
+		currentPort = takeRandom(lu.aliasToPorts)
+
+		return nil
+	}
+
+	lu.logger(
+		"reconcile LB",
+		zap.String("cluster", lu.clusterID),
+		zap.Strings("upstreams", lu.upstreamAddrs),
+		zap.String("with_port", currentPort),
+	)
+
+	u := xiter.Map(
+		func(addr string) *remote { return &remote{Addr: net.JoinHostPort(addr, currentPort)} },
+		slices.Values(lu.upstreamAddrs),
+	)
+
+	lu.l.Reconcile(u)
+
+	return nil
+}
+
+type remote struct {
+	Addr string
+}
+
+func (r *remote) HealthCheck(context.Context) (upstream.Tier, error) { return 0, nil }
+
+func takeRandom[K comparable, V any](m map[K]V) V {
+	for _, v := range m {
+		return v
+	}
+
+	return *new(V)
 }
