@@ -7,6 +7,7 @@
 package helpers
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -257,4 +258,63 @@ func GetTalosClient[T interface {
 	}
 
 	return result, nil
+}
+
+// SetPatchesCompress compresses the patches and sets them in the ClusterMachineConfigPatches.
+func SetPatchesCompress(res *omni.ClusterMachineConfigPatches, patches []*omni.ConfigPatch) error {
+	for _, patch := range patches {
+		compr, err := getCompressed(patch)
+		if err != nil {
+			return err
+		} else if compr == nil {
+			continue
+		}
+
+		if len(compr) < 1024 { // this is a small patch, decompress to check if it's all whitespace
+			if IsEmptyPatch(patch) {
+				continue
+			}
+		}
+
+		// append the patch
+		res.TypedSpec().Value.CompressedPatches = append(res.TypedSpec().Value.GetCompressedPatches(), compr)
+	}
+
+	return nil
+}
+
+func getCompressed(patch *omni.ConfigPatch) ([]byte, error) {
+	if IsEmptyPatch(patch) {
+		return nil, nil
+	}
+
+	compressedData := patch.TypedSpec().Value.GetCompressedData()
+	if len(compressedData) > 0 {
+		return compressedData, nil
+	}
+
+	buffer, err := patch.TypedSpec().Value.GetUncompressedData()
+	if err != nil {
+		return nil, err
+	}
+
+	defer buffer.Free()
+
+	if err = patch.TypedSpec().Value.SetUncompressedData(buffer.Data()); err != nil {
+		return nil, err
+	}
+
+	return patch.TypedSpec().Value.CompressedData, nil
+}
+
+// IsEmptyPatch checks if the patch is empty.
+func IsEmptyPatch(patch *omni.ConfigPatch) bool {
+	buffer, err := patch.TypedSpec().Value.GetUncompressedData()
+	if err != nil {
+		return false
+	}
+
+	defer buffer.Free()
+
+	return len(bytes.TrimSpace(buffer.Data())) == 0
 }

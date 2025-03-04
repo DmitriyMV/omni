@@ -79,3 +79,8 @@ func (h *Helper) Get(machine *omni.ClusterMachine, machineSet *omni.MachineSet) 
 		return configPatch.Metadata().Phase() == resource.PhaseRunning
 	}), nil
 }
+
+// Len returns the total number of config patches.
+func (h *Helper) Len() int {
+	return h.allConfigPatches.Len()
+}

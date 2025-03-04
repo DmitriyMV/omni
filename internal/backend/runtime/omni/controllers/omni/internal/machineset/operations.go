@@ -6,7 +6,6 @@
 package machineset
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 
@@ -214,51 +213,10 @@ func setPatches(clusterMachineConfigPatches *omni.ClusterMachineConfigPatches, p
 	clusterMachineConfigPatches.TypedSpec().Value.CompressedPatches = nil
 
 	if specs.GetCompressionConfig().Enabled {
-		return setPatchesCompress(clusterMachineConfigPatches, patches)
+		return helpers.SetPatchesCompress(clusterMachineConfigPatches, patches)
 	}
 
 	return setPatchesNoCompress(clusterMachineConfigPatches, patches)
-}
-
-//nolint:staticcheck // we are ok with using the deprecated method here
-func setPatchesCompress(res *omni.ClusterMachineConfigPatches, patches []*omni.ConfigPatch) error {
-	for _, patch := range patches {
-		compressedSize := len(patch.TypedSpec().Value.CompressedData)
-
-		if compressedSize == 0 { // patch is not compressed, compress and then append it
-			if isEmptyPatch(patch) {
-				continue
-			}
-
-			buffer, err := patch.TypedSpec().Value.GetUncompressedData()
-			if err != nil {
-				return err
-			}
-
-			if err = patch.TypedSpec().Value.SetUncompressedData(buffer.Data()); err != nil {
-				return err
-			}
-
-			res.TypedSpec().Value.CompressedPatches = append(res.TypedSpec().Value.CompressedPatches, patch.TypedSpec().Value.CompressedData)
-
-			buffer.Free() // we can already free the buffer, as we already read and compressed it
-
-			continue
-		}
-
-		// patch is compressed, append it directly
-
-		if compressedSize < 1024 { // this is a small patch, decompress to check if it's all whitespace
-			if isEmptyPatch(patch) {
-				continue
-			}
-		}
-
-		// append the patch
-		res.TypedSpec().Value.CompressedPatches = append(res.TypedSpec().Value.CompressedPatches, patch.TypedSpec().Value.CompressedData)
-	}
-
-	return nil
 }
 
 //nolint:staticcheck // we are ok with using the deprecated method here
@@ -267,7 +225,7 @@ func setPatchesNoCompress(res *omni.ClusterMachineConfigPatches, patches []*omni
 		compressedSize := len(patch.TypedSpec().Value.CompressedData)
 
 		if compressedSize == 0 { // not compressed, append the patch
-			if isEmptyPatch(patch) {
+			if helpers.IsEmptyPatch(patch) {
 				continue
 			}
 
@@ -289,15 +247,4 @@ func setPatchesNoCompress(res *omni.ClusterMachineConfigPatches, patches []*omni
 	}
 
 	return nil
-}
-
-func isEmptyPatch(patch *omni.ConfigPatch) bool {
-	buffer, err := patch.TypedSpec().Value.GetUncompressedData()
-	if err != nil {
-		return false
-	}
-
-	defer buffer.Free()
-
-	return len(bytes.TrimSpace(buffer.Data())) == 0
 }

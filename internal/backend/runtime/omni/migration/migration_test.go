@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
 	"github.com/siderolabs/gen/pair"
+	"github.com/siderolabs/gen/xiter"
 	"github.com/siderolabs/gen/xslices"
 	"github.com/siderolabs/gen/xtesting/must"
 	"github.com/siderolabs/go-pointer"
@@ -378,11 +380,11 @@ func (suite *MigrationSuite) createCluster(ctx context.Context, name string, fin
 	return cluster, machine
 }
 
-func (suite *MigrationSuite) createClusterWithMachines(ctx context.Context, name string, machines []machine, withTemplates bool) *omni.Cluster {
-	cluster := omni.NewCluster(resources.DefaultNamespace, name)
+func (suite *MigrationSuite) createClusterWithMachines(ctx context.Context, clusterName string, machines []machine, withTemplates bool) *omni.Cluster {
+	cluster := omni.NewCluster(resources.DefaultNamespace, clusterName)
 
 	for _, m := range machines {
-		id := fmt.Sprintf("%s.%s", name, m.name)
+		id := fmt.Sprintf("%s.%s", clusterName, m.name)
 		machine := omni.NewClusterMachine(resources.DefaultNamespace, id)
 		machine.TypedSpec().Value.KubernetesVersion = "v1.24.0"
 
@@ -390,7 +392,7 @@ func (suite *MigrationSuite) createClusterWithMachines(ctx context.Context, name
 		machine.Metadata().Finalizers().Add(omnictrl.NewClusterMachineConfigController("factory-test.talos.dev", nil, 8090).Name())
 
 		if withTemplates {
-			template := omni.NewClusterMachineTemplate(resources.DefaultNamespace, fmt.Sprintf("%s.%s", name, m.name))
+			template := omni.NewClusterMachineTemplate(resources.DefaultNamespace, fmt.Sprintf("%s.%s", clusterName, m.name))
 			template.TypedSpec().Value.Patch = m.patch
 			template.TypedSpec().Value.InstallDisk = testInstallDisk
 			template.TypedSpec().Value.InstallImage = "ghcr.io/siderolabs/installer:v1.1.1"
@@ -1035,6 +1037,10 @@ func (suite *MigrationSuite) TestPatchesExtraction() {
 	}
 }
 
+// создать машины
+// создать патчи которые не сжаты
+// смотрю версию
+
 func (suite *MigrationSuite) TestInstallDiskPatchMigration() {
 	ctx := suite.T().Context()
 
@@ -1093,10 +1099,18 @@ func (suite *MigrationSuite) TestInstallDiskPatchMigration() {
 		pair.MakePair[string, resource.Resource]("", clusterConfigVersion),
 	}
 
-	createResources = append(createResources, xslices.Map(machines, func(m machine) pair.Pair[string, resource.Resource] {
-		return pair.MakePair[string, resource.Resource](omnictrl.NewClusterMachineConfigController("factory-test.talos.dev", nil, 8090).Name(),
-			omni.NewClusterMachineConfig(resources.DefaultNamespace, clusterName+"."+m.name))
-	})...)
+	createResources = slices.AppendSeq(
+		createResources,
+		xiter.Map(
+			func(m machine) pair.Pair[string, resource.Resource] {
+				return pair.MakePair[string, resource.Resource](
+					omnictrl.NewClusterMachineConfigController("factory-test.talos.dev", nil, 8090).Name(),
+					omni.NewClusterMachineConfig(resources.DefaultNamespace, clusterName+"."+m.name),
+				)
+			},
+			slices.Values(machines),
+		),
+	)
 
 	for _, res := range createResources {
 		suite.Require().NoError(res.F2.Metadata().SetOwner(res.F1))
@@ -1778,6 +1792,83 @@ func checkCompressed[
 		t.NotEmpty(result)
 		t.Equalf(data, result, "%x != %x", data, result)
 	}
+}
+
+//omni.ClusterSecrets [x]
+//omni.ClusterMachine [x]
+//omni.LoadBalancerConfig [x]
+//omni.Cluster [x]
+//omni.ClusterMachineConfigPatches
+//omni.MachineConfigGenOptions
+//---->
+//omni.ClusterMachineConfig
+
+// secrets (omni.ClusterSecrets) [x]
+// clusterMachine (omni.ClusterMachine) [x]
+// loadBalancerConfig (omni.LoadBalancerConfig) [x]
+// cluster (omni.Cluster) [x]
+// clusterMachineConfigPatches (omni.ClusterMachineConfigPatches)
+// machineConfigGenOptions (omni.MachineConfigGenOptions)
+
+func (suite *MigrationSuite) TestCompressVersionEqual() {
+	ctx := suite.T().Context()
+
+	clusterName := "patches"
+	machines := []machine{
+		{
+			name: "m1",
+			labels: map[string]string{
+				"role-worker": "",
+			},
+		},
+	}
+
+	version := system.NewDBVersion(resources.DefaultNamespace, system.DBVersionID)
+	version.TypedSpec().Value.Version = 1
+
+	suite.Require().NoError(suite.state.Create(ctx, version))
+
+	suite.createClusterWithMachines(ctx, clusterName, machines, false)
+
+	m1 := "patches.m1"
+
+	machineSet := omni.NewMachineSet(resources.DefaultNamespace, omni.WorkersResourceID(clusterName))
+	machineSet.Metadata().Labels().Set(omni.LabelCluster, clusterName)
+	machineSet.Metadata().Labels().Set(omni.LabelControlPlaneRole, "")
+
+	clusterConfigVersion := omni.NewClusterConfigVersion(resources.DefaultNamespace, clusterName)
+	clusterConfigVersion.TypedSpec().Value.Version = "v1.9"
+
+	options := omni.NewMachineConfigGenOptions(resources.DefaultNamespace, m1)
+	options.TypedSpec().Value.InstallDisk = "/dev/vdb"
+	options.TypedSpec().Value.InstallImage = &specs.MachineConfigGenOptionsSpec_InstallImage{
+		TalosVersion:         "v1.9.4",
+		SchematicId:          "test-schematic-id",
+		SchematicInitialized: true,
+	}
+
+	patches := omni.NewClusterMachineConfigPatches(resources.DefaultNamespace, m1)
+
+	createResources := []pair.Pair[string, resource.Resource]{
+		pair.MakePair[string, resource.Resource]((&omnictrl.LoadBalancerController{}).Name(), omni.NewLoadBalancerConfig(resources.DefaultNamespace, clusterName)),
+		pair.MakePair[string, resource.Resource]("", omni.NewClusterSecrets(resources.DefaultNamespace, clusterName)),
+		pair.MakePair[string, resource.Resource]("", clusterConfigVersion),
+		pair.MakePair[string, resource.Resource](omnictrl.MachineConfigGenOptionsControllerName, options),
+		pair.MakePair[string, resource.Resource](omnictrl.NewMachineSetStatusController().ControllerName, patches),
+	}
+
+	createResources = slices.AppendSeq(
+		createResources,
+		xiter.Map(
+			func(m machine) pair.Pair[string, resource.Resource] {
+				return pair.MakePair[string, resource.Resource](
+					omnictrl.NewClusterMachineConfigController("factory-test.talos.dev", nil, 8090).Name(),
+					omni.NewClusterMachineConfig(resources.DefaultNamespace, clusterName+"."+m.name),
+				)
+			},
+			slices.Values(machines),
+		),
+	)
 }
 
 func TestMigrationSuite(t *testing.T) {
